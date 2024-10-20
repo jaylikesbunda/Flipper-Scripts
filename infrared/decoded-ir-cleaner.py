@@ -59,8 +59,20 @@ def extract_button_info(content):
         buttons.append(current_button)
     return buttons
 
+import re
+
+def normalize_line(line):
+    line = line.strip().lower()
+    if line.startswith('data:'):
+        # Normalize spaces in the data line
+        data_content = line[len('data:'):].strip()
+        data_numbers = data_content.split()
+        normalized_data = ' '.join(data_numbers)
+        line = 'data: ' + normalized_data
+    return line
+
 def clean_and_deduplicate(original_content, decoded_content):
-    # Extract initial content (comments and file type info)
+    # Extract initial content (headers and initial comments) from original_content
     initial_content = []
     for line in original_content:
         if line.strip().startswith('#') or line.startswith('Filetype:') or line.startswith('Version:'):
@@ -68,96 +80,122 @@ def clean_and_deduplicate(original_content, decoded_content):
         else:
             break
 
-    # Normalize initial_content to end with a single '#'
-    # Remove trailing '#' lines
+    # Ensure initial_content ends with a single '#'
     while initial_content and initial_content[-1].strip() == '#':
         initial_content.pop()
-    # Add a single '#' if there were any '#' lines in initial_content
-    if any(line.strip() == '#' for line in original_content):
+    if initial_content and initial_content[-1].strip() != '#':
         initial_content.append('#')
 
-    # Process original content to preserve comment structure
-    original_signals = []
-    current_signal = []
-    current_comments = []
-    for line in original_content[len(initial_content):]:
-        if line.strip().startswith('name:'):
-            if current_signal:
-                # Normalize comments to have a single '#'
-                normalized_comments = ['#'] if any(c.strip().startswith('#') for c in current_comments) else []
-                original_signals.append((normalized_comments, current_signal))
-                current_signal = []
-                current_comments = []
-            current_signal.append(line)
-        elif line.strip().startswith('#'):
-            current_comments.append(line)
-        else:
-            current_signal.append(line)
-    if current_signal:
-        # Normalize comments for the last signal
-        normalized_comments = ['#'] if any(c.strip().startswith('#') for c in current_comments) else []
-        original_signals.append((normalized_comments, current_signal))
-
-    # Process decoded content
-    decoded_signals = []
-    current_signal = []
+    # Remove headers from decoded_content
+    decoded_content_no_headers = []
+    skip_headers = True
     for line in decoded_content:
-        if line.strip().startswith('name:') and current_signal:
-            decoded_signals.append(current_signal)
-            current_signal = []
-        current_signal.append(line)
-    if current_signal:
-        decoded_signals.append(current_signal)
+        if skip_headers:
+            if line.strip().startswith('#') or line.startswith('Filetype:') or line.startswith('Version:'):
+                continue  # Skip header lines
+            else:
+                skip_headers = False
+                decoded_content_no_headers.append(line)
+        else:
+            decoded_content_no_headers.append(line)
 
-    # Remove duplicates from decoded signals
+    # Process content to collect signals, keeping track of source and names
+    all_signals = []
+    # Process decoded_content first to prefer decoded signals
+    for content, source in [
+        (decoded_content_no_headers, 'decoded'),
+        (original_content[len(initial_content):], 'original')
+    ]:
+        current_signal = []
+        current_comments = []
+        for line in content + ['#']:  # Add '#' to ensure the last signal is processed
+            line = line.rstrip('\n')
+            if line.strip().startswith('name:'):
+                # Start of a new signal
+                if current_signal:
+                    # Append the previous signal to all_signals
+                    all_signals.append({
+                        'name': current_signal[0].split(':', 1)[1].strip(),
+                        'comments': current_comments.copy(),
+                        'signal': current_signal.copy(),
+                        'source': source
+                    })
+                    current_signal.clear()
+                    current_comments.clear()
+                current_signal.append(line)
+            elif line.strip().startswith('#'):
+                # Comment line
+                if current_signal:
+                    # Append the previous signal before the comment
+                    all_signals.append({
+                        'name': current_signal[0].split(':', 1)[1].strip(),
+                        'comments': current_comments.copy(),
+                        'signal': current_signal.copy(),
+                        'source': source
+                    })
+                    current_signal.clear()
+                current_comments.append(line)
+            elif line.strip().startswith('Filetype:') or line.strip().startswith('Version:'):
+                # Skip these lines in the content
+                continue
+            else:
+                current_signal.append(line)
+        if current_signal:
+            # Append the last signal
+            all_signals.append({
+                'name': current_signal[0].split(':', 1).strip(),
+                'comments': current_comments.copy(),
+                'signal': current_signal.copy(),
+                'source': source
+            })
+
+    # Deduplicate signals based on 'name', preferring decoded signals
     unique_signals = {}
     duplicates_removed = 0
-    for signal in decoded_signals:
-        signature = tuple(line for line in signal if line.strip().startswith(('name:', 'type:', 'protocol:', 'address:', 'command:')))
-        if signature and signature not in unique_signals:
-            unique_signals[signature] = signal
+    for entry in all_signals:
+        name = entry['name']
+        source = entry['source']
+        if name not in unique_signals:
+            unique_signals[name] = entry
         else:
-            duplicates_removed += 1
+            existing_entry = unique_signals[name]
+            if existing_entry['source'] == 'original' and source == 'decoded':
+                # Replace original signal with decoded one
+                unique_signals[name] = entry
+                duplicates_removed += 1
+            else:
+                # Duplicate found, increment counter
+                duplicates_removed += 1
 
-    # Combine initial content, unique decoded signals, and preserved original signals
+    # Rebuild the cleaned content
     cleaned_content = initial_content.copy()
-    processed_names = set()
+    for entry in unique_signals.values():
+        comments = entry['comments']
+        signal = entry['signal']
+        # Add comments if present
+        if comments and (not cleaned_content or cleaned_content[-1].strip() != '#'):
+            cleaned_content.extend(comments)
+        # Add signal
+        cleaned_content.extend(signal)
+        # Ensure there's a '#' between signals for proper formatting
+        if cleaned_content and cleaned_content[-1].strip() != '#':
+            cleaned_content.append('#')
 
-    for comments, original_signal in original_signals:
-        name = next((line.split(':', 1)[1].strip() for line in original_signal if line.strip().startswith('name:')), None)
-        if name:
-            decoded_signal = next((s for s in unique_signals.values() if any(line.strip().startswith(f'name: {name}') for line in s)), None)
-            if decoded_signal:
-                # Append comments only if the last line is not already '#'
-                if comments and (not cleaned_content or cleaned_content[-1].strip() != '#'):
-                    cleaned_content.extend(comments)
-                cleaned_content.extend(decoded_signal)
-                processed_names.add(name)
-            elif name not in processed_names:
-                if comments and (not cleaned_content or cleaned_content[-1].strip() != '#'):
-                    cleaned_content.extend(comments)
-                cleaned_content.extend(original_signal)
-                processed_names.add(name)
-
-    # Add any remaining unique decoded signals with a single '#'
-    for signal in unique_signals.values():
-        name = next((line.split(':', 1)[1].strip() for line in signal if line.strip().startswith('name:')), None)
-        if name and name not in processed_names:
-            if cleaned_content and cleaned_content[-1].strip() != '#':
-                cleaned_content.append('#')  # Ensure only one '#' is added
-            cleaned_content.extend(signal)
-
-    # Remove any empty lines at the end of the file
-    while cleaned_content and cleaned_content[-1].strip() == '':
+    # Remove any empty lines or extra '#' at the end of the file
+    while cleaned_content and cleaned_content[-1].strip() in ('', '#'):
         cleaned_content.pop()
 
-    # **Normalization Step: Replace any '# ' with '#'**
+    # Normalize cleaned content to avoid multiple '#' lines
     normalized_cleaned_content = []
+    prev_line_was_hash = False
     for line in cleaned_content:
         if line.strip() == '#':
-            normalized_cleaned_content.append('#')
+            if not prev_line_was_hash:
+                normalized_cleaned_content.append('#')
+            prev_line_was_hash = True
         else:
             normalized_cleaned_content.append(line)
+            prev_line_was_hash = False
     cleaned_content = normalized_cleaned_content
 
     return cleaned_content, duplicates_removed
